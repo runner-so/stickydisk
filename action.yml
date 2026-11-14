@@ -1,0 +1,41 @@
+# runner-so/stickydisk (ADR 0046 §5): published from this folder as its own
+# repo. The step asks runner-guestd over its socket; no credential enters
+# the job. The control plane decides at the job's end, from webhook data
+# alone, whether the disk is committed: only a push or workflow_dispatch on
+# the default branch, or a schedule, commits it.
+name: Sticky disk
+description: Mount a persistent disk, named by key, at path. Every job gets its own clone of the last committed state.
+inputs:
+  key:
+    description: The disk's name in this repository.
+    required: true
+  path:
+    description: Where to mount it; relative to the workspace if not absolute.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        KEY: ${{ inputs.key }}
+        DISK_PATH: ${{ inputs.path }}
+      run: |
+        set -euo pipefail
+        case "$DISK_PATH" in /*) ;; *) DISK_PATH="$GITHUB_WORKSPACE/$DISK_PATH" ;; esac
+        DISK_PATH=$(realpath -m "$DISK_PATH")
+        out=$(curl -sS --max-time 3600 --unix-socket /run/runner/stickydisk.sock -w '\n%{http_code}' \
+          --data-urlencode "key=$KEY" --data-urlencode "path=$DISK_PATH" http://guestd/mount)
+        code=${out##*$'\n'}
+        body=${out%$'\n'*}
+        if [ "$code" != 200 ]; then
+          echo "::error title=Sticky disk::$KEY: $body"
+          exit 1
+        fi
+        echo "Sticky disk $KEY mounted at $DISK_PATH"
+        # Anything but "ok" is why the disk's last commit was not saved
+        # (RUN-549): it ran after that job's log closed, so it is said here.
+        body=${body%$'\n'}
+        if [ "$body" != ok ]; then
+          body=${body//'%'/'%25'}
+          echo "::warning title=Sticky disk::$KEY: ${body//$'\n'/' '}"
+        fi
